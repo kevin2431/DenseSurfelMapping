@@ -39,10 +39,10 @@ private:
     cv::Mat debug_image;
     int frame_index_;
 
-    std::vector<double> space_map;
-    std::vector<float> norm_map;
+    std::vector<double> space_map;  // 位置
+    std::vector<float> norm_map;    // 法向量，什么不用 Eigen::Vector3f
     std::vector<Superpixel_seed> superpixel_seeds;
-    std::vector<int> superpixel_index;
+    std::vector<int> superpixel_index;  // 普通像素对应哪一个超像素的索引
 
     std::vector<SurfelElement> *local_surfels_ptr;
     std::vector<SurfelElement> *new_surfels_ptr;
@@ -89,10 +89,12 @@ private:
     void debug_show();
 
 public:
+    // fuse 函数的初始化
     void initialize(
         int _width, int _height,
         float _fx, float _fy, float _cx, float _cy,
         float _fuse_far, float _fuse_near);
+    // 每次地图融合前的初始化
     void fuse_initialize_map(
         int reference_frame_index,
         cv::Mat &input_image,

@@ -22,12 +22,12 @@ struct Superpixel_seed
 
 struct SurfelElement
 {
-    float px, py, pz;
-    float nx, ny, nz;
-    float size;
-    float color;
-    float weight;
-    int update_times;
-    int last_update;
+    float px, py, pz;   // position Sp
+    float nx, ny, nz;   // normal Sn
+    float size; //  Sr 半径
+    float color;    // intensity Sc
+    float weight;   // >0 Sw
+    int update_times;   //St
+    int last_update;    // Si  上一个观测到这个面片的关键帧
     cv::Vec3b rgb_color;
 };

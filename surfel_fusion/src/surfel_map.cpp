@@ -26,6 +26,7 @@ rgb_inactive_pcd (new RgbPointCloud)
     camera_matrix(1, 2) = cam_cy;
     camera_matrix(2, 2) = 1.0;
 
+    // launch 文件里面有的
     get_all &= nh.getParam("fuse_far_distence", far_dist);
     get_all &= nh.getParam("fuse_near_distence", near_dist);
     get_all &= nh.getParam("drift_free_poses", drift_free_poses);
@@ -52,6 +53,7 @@ rgb_inactive_pcd (new RgbPointCloud)
     // cudaMalloc(&fuse_param_gpuptr, sizeof(FuseParameters));
     // cudaMemcpy(fuse_param_gpuptr, &fuse_param, sizeof(FuseParameters), cudaMemcpyHostToDevice);
 
+    // surfel fusion的初始化，每一次都会重新融合，不会更新
     fusion_functions.initialize(cam_width, cam_height, cam_fx, cam_fy, cam_cx, cam_cy, far_dist, near_dist);
 
     // ros publisher
@@ -75,6 +77,8 @@ rgb_inactive_pcd (new RgbPointCloud)
 
     // [Realsense] Transfer from depth image plane to color image plane
     // [Realsense] Infra1 image and Depth image are on the same plane
+    // realsense 不是可以直接 align吗
+    // 这边是深度到cmera的转换
     T_d2c = Eigen::Matrix4d::Identity();
     T_d2c(0,0) = 0.9998767375946045;
     T_d2c(0,1) = -0.015462320297956467;
@@ -129,6 +133,7 @@ void SurfelMap::save_map(const std_msgs::StringConstPtr &save_map_input)
 
 void SurfelMap::image_input(const sensor_msgs::ImageConstPtr &image_input)
 {
+    // 初始化后 surfel就是 true的
     if(surfel_state){
 //         printf("receive grey_image!\n");
 //        cv_bridge::CvImagePtr image_ptr = cv_bridge::toCvCopy(image_input, sensor_msgs::image_encodings::TYPE_8UC1);
@@ -169,6 +174,7 @@ void SurfelMap::depth_input(const sensor_msgs::ImageConstPtr &depth_input)
             cv_bridge::CvImagePtr image_ptr;
             image_ptr = cv_bridge::toCvCopy(depth_input, depth_input->encoding);
             constexpr double kDepthScalingFactor = 0.001;
+            // 16为变32位 realsense的 raw data 是16Uc1的
             if(depth_input->encoding == sensor_msgs::image_encodings::TYPE_16UC1)
                 (image_ptr->image).convertTo(image_ptr->image, CV_32FC1, kDepthScalingFactor);
             // image_ptr = cv_bridge::toCvCopy(depth_input, sensor_msgs::image_encodings::TYPE_32FC1);
@@ -188,9 +194,13 @@ void SurfelMap::synchronize_msgs()
     std::chrono::duration<double> total_time;
     start_time = std::chrono::system_clock::now();
 
+    // 必须要等待有新的pose更新才可以
     if(pose_reference_buffer.size() == 0)
         return;
     
+    // 因为ros是异步的，有阻塞，所以这个里面是buffer 队列
+    // 这个不加锁不会出现buffer一直增加，然后出不来的情况吗？
+    // 只有加入新的 pose 才会触发这个函数
     for(int scan_pose = 0; scan_pose < pose_reference_buffer.size(); scan_pose++)
     {
         ros::Time fuse_stamp = pose_reference_buffer[scan_pose].first;
@@ -198,6 +208,7 @@ void SurfelMap::synchronize_msgs()
         int image_num = -1;
         int depth_num = -1;
 
+        // 现寻找最接近pose时间的image 和 depth 记录在vector的位置
         for(int image_i = 0; image_i < image_buffer.size(); image_i++)
         {
             double image_time = image_buffer[image_i].first.toSec();
@@ -222,6 +233,7 @@ void SurfelMap::synchronize_msgs()
         if( image_num < 0 || depth_num < 0)
             continue;
 
+        // vins 就是上一个关键帧，fuse_pose 就是当前pose需要融合到的参考pose
         int relative_index = pose_reference_buffer[scan_pose].second;
         geometry_msgs::Pose fuse_pose = poses_database[relative_index].cam_pose;
         Eigen::Matrix4d fuse_pose_eigen;
@@ -308,6 +320,7 @@ void SurfelMap::extrinsic_input(const nav_msgs::OdometryConstPtr &ex_input)
 
 }
 
+// vins push的pose graph 和basalt最为接近了
 int lst_path_size;
 void SurfelMap::path_input(const nav_msgs::PathConstPtr &loop_path_input)
 {   
@@ -331,14 +344,17 @@ void SurfelMap::path_input(const nav_msgs::PathConstPtr &loop_path_input)
             }
     }
 */
+        // 记录最新的pose大小，没变化不更新
         if(lst_path_size == loop_path_input->poses.size())
             return;
 
         lst_path_size = loop_path_input->poses.size();
 
+        // 第一次更新或者外参还没有初始化好，不更新
         if(is_first_path || (!extrinsic_matrix_initialized))
         {
             is_first_path = false;
+            // 记录没有完成初始化时间前 path的时间戳
             pre_path_delete_time = loop_path_input->poses.back().header.stamp.toSec();
             return;
         }
@@ -365,12 +381,17 @@ void SurfelMap::path_input(const nav_msgs::PathConstPtr &loop_path_input)
         geometry_msgs::PoseStamped cam_posestamped;
         for(int i = 0; i < loop_path_input->poses.size(); i++)
         {
+            // 获得的pose 应该是imu坐标系的
             geometry_msgs::PoseStamped imu_posestamped = loop_path_input->poses[i];
+            // 没初始化前的path 都丢弃
             if(imu_posestamped.header.stamp.toSec() < pre_path_delete_time)
                 continue;
+            // fusion 里的都是在camera下，甚至应该是左目吧
             cam_posestamped = imu_posestamped;
             Eigen::Matrix4d imu_t, cam_t;
             pose_ros2eigen(imu_posestamped.pose, imu_t);
+            // Tw_b * Tb_c = T_w_c 
+            // 这边还要转化到color上，我们的cmera就是infrared1，和深度是一样的坐标
             cam_t = imu_t * extrinsic_matrix * T_d2c;
             pose_eigen2ros(cam_t, cam_posestamped.pose);
             camera_path.poses.push_back(cam_posestamped);
@@ -386,7 +407,7 @@ void SurfelMap::path_input(const nav_msgs::PathConstPtr &loop_path_input)
             input_pose = camera_path.poses.back().pose;
             have_new_pose = true;
         }*/
-
+        // camera的path大于pose数据库，就认为有新的pose
         if(camera_path.poses.size() > poses_database.size())
         {
             have_new_pose = true;
@@ -399,6 +420,7 @@ void SurfelMap::path_input(const nav_msgs::PathConstPtr &loop_path_input)
 
             poses_database[i].loop_pose = camera_path.poses[i].pose;
 
+            // 当跟新的loop_pose 和 最初的cam_pose 不一致就认为是发生了回路改变
             if( poses_database[i].loop_pose.position.x != poses_database[i].cam_pose.position.x
                 || poses_database[i].loop_pose.position.y != poses_database[i].cam_pose.position.y
                 || poses_database[i].loop_pose.position.z != poses_database[i].cam_pose.position.z)
@@ -410,6 +432,8 @@ void SurfelMap::path_input(const nav_msgs::PathConstPtr &loop_path_input)
         //printf("warp the surfels according to the loop!\n");
         std::chrono::time_point<std::chrono::system_clock> start_time, end_time;
         start_time = std::chrono::system_clock::now();
+        // 有回路改变，warp_surfels
+        // 就是 deformation的意思
         if(loop_changed)
         {
             warp_surfels();
@@ -425,6 +449,7 @@ void SurfelMap::path_input(const nav_msgs::PathConstPtr &loop_path_input)
             {
                 if(poses_database.size() > 0)
                 {
+                    // 若不是第一次，只创建时间戳大于pose data最后一个的，就是还没有的
                     if(camera_path.poses[i].header.stamp.toSec() > poses_database.back().cam_stamp.toSec())
                     {
                         PoseElement this_pose_element;
@@ -435,6 +460,7 @@ void SurfelMap::path_input(const nav_msgs::PathConstPtr &loop_path_input)
 
                         //if(poses_database.size() > 0)
                         //{
+                        // 这边直接拿上一个关键帧
                         int relative_index = poses_database.size() - 1;
                         this_pose_element.linked_pose_index.push_back(relative_index);
                         poses_database[relative_index].linked_pose_index.push_back(this_pose_index); //}
@@ -447,15 +473,19 @@ void SurfelMap::path_input(const nav_msgs::PathConstPtr &loop_path_input)
                 }
                 else
                 {
+                    // 第一次的时候，第一个关键帧
                     PoseElement this_pose_element;
                     int this_pose_index = poses_database.size();
+                    // 初始化的时候 cam loop pose是一致的
                     this_pose_element.cam_pose  = camera_path.poses[i].pose;
                     this_pose_element.loop_pose = camera_path.poses[i].pose;
                     this_pose_element.cam_stamp = camera_path.poses[i].header.stamp;
 
                     poses_database.push_back(this_pose_element);
+                    // local_surfels 对应 pose_dataset吗？？应该不是吧
                     local_surfels_indexs.insert(this_pose_index);
 
+                    // 这个buffer里面就是pose时间戳，在local surfel里面的index
                     pose_reference_buffer.push_back(std::make_pair(camera_path.poses[i].header.stamp, this_pose_index));
                 }
             }
@@ -736,6 +766,7 @@ void SurfelMap::fuse_map(cv::Mat image, cv::Mat depth, Eigen::Matrix4f pose_inpu
     //printf("fuse surfels with reference index %d and %d surfels!\n", reference_index, local_surfels.size());    
     Timer fuse_timer("fusing");
 
+    // 
     vector<SurfelElement> new_surfels;
     fusion_functions.fuse_initialize_map(
         reference_index,
@@ -1227,6 +1258,8 @@ void SurfelMap::move_all_surfels()
     }
 }
 
+// move 从local sufel 中加入到inactive
+// add 先要从inactive中取出，然后加入到local
 void SurfelMap::move_add_surfels(int reference_index)
 {
     // remove inactive surfels
@@ -1247,11 +1280,14 @@ void SurfelMap::move_add_surfels(int reference_index)
         for(int pi = 0; pi < poses_to_remove.size(); pi++)
         {
             int inactive_index = poses_to_remove[pi];
+            // 开始的索引是 inactive点云的顺序
             poses_database[inactive_index].points_begin_index = inactive_pointcloud->size();
+            // pose index 是pointcloud_pose_index大小，里面记录inactive_index
             poses_database[inactive_index].points_pose_index = pointcloud_pose_index.size();
             pointcloud_pose_index.push_back(inactive_index);
             for(int i = 0; i < local_surfels.size(); i++)
             {
+                // 如果local surfel上次更新和这个要move的相关
                 if(local_surfels[i].update_times > 0 && local_surfels[i].last_update == inactive_index)
                 {
                     poses_database[inactive_index].attached_surfels.push_back(local_surfels[i]);
@@ -1291,6 +1327,7 @@ void SurfelMap::move_add_surfels(int reference_index)
     if(poses_to_add.size() > 0)
     {
         // 1.0 add indexs
+        // 在local surfel中插入 300 range的
         local_surfels_indexs.insert(poses_to_add.begin(), poses_to_add.end());
         // 2.0 add surfels
         // 2.1 remove from inactive_pointcloud
@@ -1379,9 +1416,10 @@ void SurfelMap::move_add_surfels(int reference_index)
     }
 }
 
+// root_index 是上一个关键帧
 void SurfelMap::get_add_remove_poses(int root_index, vector<int> &pose_to_add, vector<int> &pose_to_remove)
 {
-    vector<int> driftfree_poses;
+    vector<int> driftfree_poses;    //无漂移的pose
     get_driftfree_poses(root_index, driftfree_poses, drift_free_poses);
     {
 /*        printf("\ndriftfree poses: ");
@@ -1393,6 +1431,7 @@ void SurfelMap::get_add_remove_poses(int root_index, vector<int> &pose_to_add, v
     pose_to_add.clear();
     pose_to_remove.clear();
     // get to add
+    // 如果这个driftfree pose不在local surfel里面，就加入
     for(int i = 0; i < driftfree_poses.size(); i++)
     {
         int temp_pose = driftfree_poses[i];
@@ -1407,6 +1446,8 @@ void SurfelMap::get_add_remove_poses(int root_index, vector<int> &pose_to_add, v
         }
     }*/
     // get to remove
+    // 如果local surfel 不在 drift里面，就remove
+    // 那么剩下来的local surfel呢？？
     for(auto i = local_surfels_indexs.begin(); i != local_surfels_indexs.end(); i++)
     {
         int temp_pose = *i;
@@ -1425,6 +1466,8 @@ void SurfelMap::get_add_remove_poses(int root_index, vector<int> &pose_to_add, v
     }
 }
 
+// 默认参数输入是300个
+// 那么这样就是前300个关键帧呀，如果不发生闭环，linked_pose_index就是前一个
 void SurfelMap::get_driftfree_poses(int root_index, vector<int> &driftfree_poses, int driftfree_range)
 {
     if(poses_database.size() < root_index + 1)
@@ -1437,6 +1480,7 @@ void SurfelMap::get_driftfree_poses(int root_index, vector<int> &driftfree_poses
     this_level.push_back(root_index);
     driftfree_poses.push_back(root_index);
     // get the drift
+    // 如果没有闭环是不是就是前300个 关键帧
     for(int i = 1; i < driftfree_range; i++)
     {
         for(auto this_it = this_level.begin(); this_it != this_level.end(); this_it++)

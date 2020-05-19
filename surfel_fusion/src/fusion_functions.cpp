@@ -44,6 +44,7 @@ void FusionFunctions::fuse_initialize_map(
     // grey_image = input_image.clone();
     // depth = input_depth.clone();
 
+    // image 都转化为灰度图
     raw_image = input_image;
     if(input_image.type() == 0) {
         grey_image = input_image;
@@ -383,10 +384,12 @@ bool FusionFunctions::calculate_cost(
     const int &x, const int &y,
     const int &sp_x, const int &sp_y)
 {
-    int sp_index = sp_y * sp_width + sp_x;
+    int sp_index = sp_y * sp_width + sp_x; 
     nodepth_cost = 0;
+    // 无深度的距离
     float dist =
         (superpixel_seeds[sp_index].x - x) * (superpixel_seeds[sp_index].x - x) + (superpixel_seeds[sp_index].y - y) * (superpixel_seeds[sp_index].y - y);
+    // 有深度的距离
     nodepth_cost += dist / ((SP_SIZE / 2) * (SP_SIZE / 2));
     float intensity_diff = (superpixel_seeds[sp_index].mean_intensity - pixel_intensity);
     nodepth_cost += intensity_diff * intensity_diff / 100.0;
@@ -405,32 +408,42 @@ bool FusionFunctions::calculate_cost(
 void FusionFunctions::update_pixels_kernel(
     int thread_i, int thread_num)
 {
+    // 线程按照行分别进行处理 用局部性
     int step_row = image_height / thread_num;
     int start_row = step_row * thread_i;
     int end_row = start_row + step_row;
     if(thread_i == thread_num - 1)
         end_row = image_height;
+    
+    // 便利该线程内所有的pixel
     for(int row_i = start_row; row_i < end_row; row_i++)
     for(int col_i = 0; col_i < image_width; col_i++)
     {
+        // 若对应的超像素已经稳定了，跳过
         if(superpixel_seeds[superpixel_index[row_i * image_width + col_i]].stable)
             continue;
         float my_intensity = grey_image.at<uchar>(row_i, col_i);
         float my_inv_depth = 0.0;
         if (depth.at<float>(row_i, col_i) > 0.01)
             my_inv_depth = 1.0 / depth.at<float>(row_i, col_i);
+        
+        // 基准sp位置
         int base_sp_x = col_i / SP_SIZE;
         int base_sp_y = row_i / SP_SIZE;
+        // 论文中对应的两种有无深度的distance
         float min_dist_depth = 1e6;
         int min_sp_index_depth = -1;
         float min_dist_nodepth = 1e6;
         int min_sp_index_nodepth = -1;
         bool all_has_depth = true;
+        // 这就是9个位置 周围的超像素
         for(int check_i = -1; check_i <= 1; check_i ++)
         for(int check_j = -1; check_j <= 1; check_j ++)
         {
+            // 周围candidate的sp
             int check_sp_x = base_sp_x + check_i;
             int check_sp_y = base_sp_y + check_j;
+            // 候选sp中心和当前pixel之间存在dist
             int dist_sp_x = fabs(check_sp_x * SP_SIZE + SP_SIZE/2 - col_i);
             int dist_sp_y = fabs(check_sp_y * SP_SIZE + SP_SIZE/2 - row_i);
             if (dist_sp_x < SP_SIZE && dist_sp_y < SP_SIZE &&
@@ -438,11 +451,14 @@ void FusionFunctions::update_pixels_kernel(
                 check_sp_y >= 0 && check_sp_y < sp_height)
             {
                 float dist_depth, dist_nodepth;
+                // 按照有无深度的方式计算了像素到该 sp类的距离
                 all_has_depth &= calculate_cost(
                     dist_nodepth,
                     dist_depth,
                     my_intensity, my_inv_depth,
                     col_i, row_i, check_sp_x, check_sp_y);
+                
+                // 对最小距离位置index的更新
                 if (dist_depth < min_dist_depth)
                 {
                     min_dist_depth = dist_depth;
@@ -455,6 +471,7 @@ void FusionFunctions::update_pixels_kernel(
                 }
             }
         }
+        // 该像素对应的最小距离 sp类的index，就是这个像素属于哪个类
         if(all_has_depth)
         {
             superpixel_index[row_i * image_width + col_i] = min_sp_index_depth;
@@ -552,6 +569,7 @@ void FusionFunctions::update_pixels()
 //     }
 // }
 
+// pixel更新后，超像素的更新
 void FusionFunctions::update_seeds_kernel(
     int thread_i, int thread_num)
 {
@@ -566,6 +584,7 @@ void FusionFunctions::update_seeds_kernel(
             continue;
         int sp_x = seed_i % sp_width;
         int sp_y = seed_i / sp_width;
+        // 超像素对应的块边界，后面在image边缘还要check一下
         int check_x_begin = sp_x * SP_SIZE + SP_SIZE / 2 - SP_SIZE;
         int check_y_begin = sp_y * SP_SIZE + SP_SIZE / 2 - SP_SIZE;
         int check_x_end = check_x_begin + SP_SIZE * 2;
@@ -585,6 +604,7 @@ void FusionFunctions::update_seeds_kernel(
         for (int check_i = check_x_begin; check_i < check_x_end; check_i ++)
         {
             int pixel_index = check_j * image_width + check_i;
+            // pixel属于这个seed才更新，万一可能seed中心位置不是在哪个1/2处，因为会搜寻有深度的点
             if (superpixel_index[pixel_index] == seed_i)
             {
                 sum_x += check_i;
@@ -602,6 +622,7 @@ void FusionFunctions::update_seeds_kernel(
         }
         if (sum_intensity_num == 0)
             return;
+        // 光强均值，像素坐标重心
         sum_intensity /= sum_intensity_num;
         sum_x /= sum_intensity_num;
         sum_y /= sum_intensity_num;
@@ -611,9 +632,12 @@ void FusionFunctions::update_seeds_kernel(
         superpixel_seeds[seed_i].mean_intensity = sum_intensity;
         superpixel_seeds[seed_i].x = sum_x;
         superpixel_seeds[seed_i].y = sum_y;
+        // 如果和之前的位置，光照变换在0.2内，就看做稳定了
         float update_diff = fabs(pre_intensity - sum_intensity) + fabs(pre_x - sum_x) + fabs(pre_y - sum_y);
         if (update_diff < 0.2)
             superpixel_seeds[seed_i].stable = true;
+
+        // 论文中对应的 hubel loss 处理深度的方式，有数学依据的
         if (sum_depth_num > 0)
         {
             float mean_depth = sum_depth / sum_depth_num;
@@ -661,19 +685,26 @@ void FusionFunctions::update_seeds()
 void FusionFunctions::initialize_seeds_kernel(
     int thread_i, int thread_num)
 {
+    // 步长，一个线程包含的超像素 seed数目
     int step = superpixel_seeds.size() / thread_num;
     int begin_index = step * thread_i;
     int end_index = begin_index + step;
+    // 最后一个线程，保证处理完所有的seed。可能两种情况 过多 或 过少 除非刚刚好
     if (thread_i == thread_num - 1)
         end_index = superpixel_seeds.size();
     for (int seed_i = begin_index; seed_i < end_index; seed_i++)
     {
+        // 对应 sp image 里面的位置
         int sp_x = seed_i % sp_width;
         int sp_y = seed_i / sp_width;
+        // 对应像素坐标的中心
         int image_x = sp_x * SP_SIZE + SP_SIZE / 2;
         int image_y = sp_y * SP_SIZE + SP_SIZE / 2;
+        // 处理图像边界的情况
         image_x = image_x < (image_width - 1) ? image_x : (image_width - 1);
         image_y = image_y < (image_height - 1) ? image_y : (image_height - 1);
+
+        // sp_seed 初始化 取了中心的？？有平均？
         Superpixel_seed this_sp;
         this_sp.x = image_x;
         this_sp.y = image_y;
@@ -682,6 +713,8 @@ void FusionFunctions::initialize_seeds_kernel(
         this_sp.stable = false;
         this_sp.mean_depth = depth.at<float>(image_y, image_x);
 //        this_sp.rgb_color = cv::Vec3b(0,0,0);
+
+        // 小于10cm说明深度有问题，找super_pixel这个pattern内的深度，如果有合格的，就当做平均深度？？
         if(this_sp.mean_depth < 0.01)
         {
             int check_x_begin = sp_x * SP_SIZE + SP_SIZE / 2 - SP_SIZE;
@@ -718,6 +751,7 @@ void FusionFunctions::initialize_seeds()
     std::vector<std::thread> thread_pool;
     for (int i = 0; i < THREAD_NUM; i++)
     {
+        // 类成员函数构造 类函数 实例化的对象指针（这里的this） 参数
         std::thread this_thread(&FusionFunctions::initialize_seeds_kernel, this, i, THREAD_NUM);
         thread_pool.push_back(std::move(this_thread));
     }
@@ -1539,6 +1573,7 @@ void FusionFunctions::calculate_sp_depth_norms_kernel(int thread_i, int thread_n
 
 void FusionFunctions::calculate_norms()
 {
+    // 三个线程池，依次计算空间位置，pixel法向量，sp的法向量
     std::vector<std::thread> thread_pool;
     for (int i = 0; i < THREAD_NUM; i++)
     {
@@ -1583,17 +1618,22 @@ void FusionFunctions::calculate_norms()
 
 void FusionFunctions::generate_super_pixels()
 {
+    // 重置一遍内容
     // std::fill(superpixel_seeds.begin(), superpixel_seeds.end(), 0);
+    // 可能数据类型不同，用menset
     memset(superpixel_seeds.data(), 0, superpixel_seeds.size() * sizeof(Superpixel_seed));
+    // float double 的向量置0
     std::fill(superpixel_index.begin(), superpixel_index.end(), 0);
     std::fill(norm_map.begin(), norm_map.end(), 0);
     initialize_seeds();
 
     for (int it_i = 0; it_i < ITERATION_NUM; it_i++)
     {
+        // 先更新pixel 后更新sp
         update_pixels();
         update_seeds();
     }
+    // 上述更新后，会有像素位置 深度 光强信息
     calculate_norms();
     debug_show();
 }
